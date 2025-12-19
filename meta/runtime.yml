@@ -11,6 +11,7 @@ action_groups:
   - artifact
   - container_distribution
   - container_remote
+  - container_repositories
   - container_repository
   - container_sync
   - deb_distribution
