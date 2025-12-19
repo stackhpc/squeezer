@@ -1,6 +1,6 @@
 #!/usr/bin/python
 
-# copyright (c) 2021, Mark Goddard
+# copyright (c) 2025, Alex Welsh
 # GNU General Public License v3.0+ (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
 
 
@@ -34,13 +34,13 @@ options:
         default: present
   concurrency:
     description:
-      - Maximum number of concurrent operations
+      - Maximum number of concurrent API requests
     type: int
     default: 10
 extends_documentation_fragment:
   - pulp.squeezer.pulp
 author:
-  - Mark Goddard (@markgoddard)
+  - Alex Welsh (@alex-welsh)
 """
 
 EXAMPLES = r"""
@@ -108,16 +108,23 @@ RETURN = r"""
 
 import traceback
 import concurrent.futures
+import os
 
 from ansible_collections.pulp.squeezer.plugins.module_utils.pulp_glue import PulpAnsibleModule
 
 try:
     from pulp_glue.container.context import PulpContainerRepositoryContext
+    from pulp_glue.common.context import PulpContext
+    from pulp_glue.common.openapi import BasicAuthProvider
+    from pulp_glue.common import __version__ as pulp_glue_version
 
     PULP_GLUE_IMPORT_ERR = None
 except ImportError:
     PULP_GLUE_IMPORT_ERR = traceback.format_exc()
     PulpContainerRepositoryContext = None
+    PulpContext = None
+    BasicAuthProvider = None
+    pulp_glue_version = None
 
 
 class PulpBatchEntityAnsibleModule(PulpAnsibleModule):
@@ -133,7 +140,31 @@ class PulpBatchEntityAnsibleModule(PulpAnsibleModule):
             "msg": "",
         }
         try:
-            context = self.context_class(self.pulp_ctx)
+            # Create a separate PulpContext for this thread to avoid correlation ID conflicts
+            auth_args = {}
+            if self.params["username"]:
+                auth_args["auth_provider"] = BasicAuthProvider(
+                    username=self.params["username"],
+                    password=self.params["password"],
+                )
+
+            pulp_ctx = PulpContext(
+                api_root="/pulp/",
+                api_kwargs=dict(
+                    base_url=self.params["pulp_url"],
+                    cert=self.params["user_cert"],
+                    key=self.params["user_key"],
+                    validate_certs=self.params["validate_certs"],
+                    refresh_cache=self.params["refresh_api_cache"],
+                    user_agent=f"Squeezer/{pulp_glue_version}",
+                    **auth_args,
+                ),
+                background_tasks=False,
+                timeout=self.params["timeout"],
+                fake_mode=self.check_mode,
+            )
+
+            context = self.context_class(pulp_ctx)
             natural_key = {"name": entity["name"]}
             desired_attributes = {}
             if "description" in entity and entity["description"] is not None:
