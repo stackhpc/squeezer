@@ -6,6 +6,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 
+import concurrent.futures
 import traceback
 
 from ansible.module_utils.basic import AnsibleModule, env_fallback, missing_required_lib
@@ -293,3 +294,124 @@ class PulpRemoteAnsibleModule(PulpEntityAnsibleModule):
             desired_attributes["password"] = self.params["remote_password"]
 
         super().process(natural_key, desired_attributes)
+
+
+class PulpBatchEntityAnsibleModule(PulpAnsibleModule):
+    """Base class for batch processing multiple entities concurrently.
+
+    This class allows processing multiple entities in parallel using a thread pool.
+    Each entity is processed independently with its own PulpContext to avoid
+    correlation ID conflicts.
+
+    Args:
+        context_class: The pulp-glue context class for the entity type
+        entity_singular: Singular name for the entity (e.g., "repository")
+        entity_plural: Plural name for the entity (e.g., "repositories")
+        entity_attributes: List of attribute names beyond "name" to process
+        **kwargs: Additional arguments passed to PulpAnsibleModule
+    """
+
+    def __init__(
+        self, context_class, entity_singular, entity_plural, entity_attributes=None, **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.context_class = context_class
+        self.entity_singular = entity_singular
+        self.entity_plural = entity_plural
+        self.entity_attributes = entity_attributes or []
+
+    def _create_pulp_context(self):
+        """Create a new PulpContext for thread-safe operations."""
+        auth_args = {}
+        if self.params["username"]:
+            auth_args["auth_provider"] = BasicAuthProvider(
+                username=self.params["username"],
+                password=self.params["password"],
+            )
+
+        return PulpContext(
+            api_root="/pulp/",
+            api_kwargs=dict(
+                base_url=self.params["pulp_url"],
+                cert=self.params["user_cert"],
+                key=self.params["user_key"],
+                validate_certs=self.params["validate_certs"],
+                refresh_cache=self.params["refresh_api_cache"],
+                user_agent=f"Squeezer/{__VERSION__}",
+                **auth_args,
+            ),
+            background_tasks=False,
+            timeout=self.params["timeout"],
+            fake_mode=self.check_mode,
+        )
+
+    def process_single_entity(self, entity):
+        """Process a single entity and return the result.
+
+        Args:
+            entity: Dictionary containing entity data with at least "name" key
+
+        Returns:
+            Dictionary with keys: name, changed, failed, msg, and optionally the entity
+        """
+        result = {
+            "name": entity["name"],
+            "changed": False,
+            "failed": False,
+            "msg": "",
+        }
+        try:
+            pulp_ctx = self._create_pulp_context()
+            context = self.context_class(pulp_ctx)
+            natural_key = {"name": entity["name"]}
+            desired_attributes = {}
+
+            # Extract configured attributes from entity
+            for attr in self.entity_attributes:
+                if attr in entity and entity[attr] is not None:
+                    desired_attributes[attr] = entity[attr]
+
+            state = entity.get("state", "present")
+            if state == "present":
+                desired_entity = desired_attributes
+            elif state == "absent":
+                desired_entity = None
+            else:
+                result["failed"] = True
+                result["msg"] = f"Invalid state '{state}'"
+                return result
+
+            context.entity = natural_key
+            changed, before, after = context.converge(desired_entity)
+            if changed:
+                result["changed"] = True
+            if after is not None:
+                result[self.entity_singular] = after
+        except Exception as e:
+            result["failed"] = True
+            result["msg"] = str(e)
+        return result
+
+    def process_batch(self, entities, concurrency=10):
+        """Process multiple entities concurrently.
+
+        Args:
+            entities: List of entity dictionaries to process
+            concurrency: Maximum number of concurrent API requests
+        """
+        results = []
+        overall_changed = False
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(self.process_single_entity, entity) for entity in entities]
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result["changed"]:
+                    overall_changed = True
+                results.append(result)
+
+        # Sort results by original order
+        results.sort(key=lambda x: [e["name"] for e in entities].index(x["name"]))
+
+        if overall_changed:
+            self.set_changed()
+        self.set_result(self.entity_plural, results)

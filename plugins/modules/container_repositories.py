@@ -107,113 +107,26 @@ RETURN = r"""
 
 
 import traceback
-import concurrent.futures
-import os
 
-from ansible_collections.pulp.squeezer.plugins.module_utils.pulp_glue import PulpAnsibleModule
+from ansible_collections.pulp.squeezer.plugins.module_utils.pulp_glue import (
+    PulpBatchEntityAnsibleModule,
+)
 
 try:
     from pulp_glue.container.context import PulpContainerRepositoryContext
-    from pulp_glue.common.context import PulpContext
-    from pulp_glue.common.openapi import BasicAuthProvider
-    from pulp_glue.common import __version__ as pulp_glue_version
 
     PULP_GLUE_IMPORT_ERR = None
 except ImportError:
     PULP_GLUE_IMPORT_ERR = traceback.format_exc()
     PulpContainerRepositoryContext = None
-    PulpContext = None
-    BasicAuthProvider = None
-    pulp_glue_version = None
-
-
-class PulpBatchEntityAnsibleModule(PulpAnsibleModule):
-    def __init__(self, context_class, **kwargs):
-        super().__init__(**kwargs)
-        self.context_class = context_class
-
-    def process_single_entity(self, entity):
-        result = {
-            "name": entity["name"],
-            "changed": False,
-            "failed": False,
-            "msg": "",
-        }
-        try:
-            # Create a separate PulpContext for this thread to avoid correlation ID conflicts
-            auth_args = {}
-            if self.params["username"]:
-                auth_args["auth_provider"] = BasicAuthProvider(
-                    username=self.params["username"],
-                    password=self.params["password"],
-                )
-
-            pulp_ctx = PulpContext(
-                api_root="/pulp/",
-                api_kwargs=dict(
-                    base_url=self.params["pulp_url"],
-                    cert=self.params["user_cert"],
-                    key=self.params["user_key"],
-                    validate_certs=self.params["validate_certs"],
-                    refresh_cache=self.params["refresh_api_cache"],
-                    user_agent=f"Squeezer/{pulp_glue_version}",
-                    **auth_args,
-                ),
-                background_tasks=False,
-                timeout=self.params["timeout"],
-                fake_mode=self.check_mode,
-            )
-
-            context = self.context_class(pulp_ctx)
-            natural_key = {"name": entity["name"]}
-            desired_attributes = {}
-            if "description" in entity and entity["description"] is not None:
-                desired_attributes["description"] = entity["description"]
-
-            state = entity.get("state", "present")
-            if state == "present":
-                desired_entity = desired_attributes
-            elif state == "absent":
-                desired_entity = None
-            else:
-                result["failed"] = True
-                result["msg"] = f"Invalid state '{state}'"
-                return result
-
-            # Simulate the converge logic
-            context.entity = natural_key
-            changed, before, after = context.converge(desired_entity)
-            if changed:
-                result["changed"] = True
-            if after is not None:
-                result["repository"] = after
-        except Exception as e:
-            result["failed"] = True
-            result["msg"] = str(e)
-        return result
-
-    def process_batch(self, entities, concurrency=10):
-        results = []
-        overall_changed = False
-        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [executor.submit(self.process_single_entity, entity) for entity in entities]
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if result["changed"]:
-                    overall_changed = True
-                results.append(result)
-
-        # Sort results by original order
-        results.sort(key=lambda x: [e["name"] for e in entities].index(x["name"]))
-
-        if overall_changed:
-            self.set_changed()
-        self.set_result("repositories", results)
 
 
 def main():
     with PulpBatchEntityAnsibleModule(
         context_class=PulpContainerRepositoryContext,
+        entity_singular="repository",
+        entity_plural="repositories",
+        entity_attributes=["description"],
         import_errors=[("pulp-glue", PULP_GLUE_IMPORT_ERR)],
         argument_spec={
             "repositories": {
@@ -234,3 +147,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
