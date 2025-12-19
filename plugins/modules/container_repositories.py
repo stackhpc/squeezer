@@ -32,6 +32,11 @@ options:
         type: str
         choices: ["present", "absent"]
         default: present
+  concurrency:
+    description:
+      - Maximum number of concurrent operations
+    type: int
+    default: 10
 extends_documentation_fragment:
   - pulp.squeezer.pulp
 author:
@@ -51,6 +56,18 @@ EXAMPLES = r"""
       - name: repo2
         description: Another repository
         state: present
+
+- name: Create multiple container repositories with custom concurrency
+  pulp.squeezer.container_repositories:
+    pulp_url: https://pulp.example.org
+    username: admin
+    password: password
+    concurrency: 5
+    repositories:
+      - name: repo1
+        description: A brand new repository
+      - name: repo2
+        description: Another repository
 
 - name: Delete multiple container repositories
   pulp.squeezer.container_repositories:
@@ -90,6 +107,7 @@ RETURN = r"""
 
 
 import traceback
+import concurrent.futures
 
 from ansible_collections.pulp.squeezer.plugins.module_utils.pulp_glue import PulpAnsibleModule
 
@@ -107,46 +125,55 @@ class PulpBatchEntityAnsibleModule(PulpAnsibleModule):
         super().__init__(**kwargs)
         self.context_class = context_class
 
-    def process_batch(self, entities):
+    def process_single_entity(self, entity):
+        result = {
+            "name": entity["name"],
+            "changed": False,
+            "failed": False,
+            "msg": "",
+        }
+        try:
+            context = self.context_class(self.pulp_ctx)
+            natural_key = {"name": entity["name"]}
+            desired_attributes = {}
+            if "description" in entity and entity["description"] is not None:
+                desired_attributes["description"] = entity["description"]
+
+            state = entity.get("state", "present")
+            if state == "present":
+                desired_entity = desired_attributes
+            elif state == "absent":
+                desired_entity = None
+            else:
+                result["failed"] = True
+                result["msg"] = f"Invalid state '{state}'"
+                return result
+
+            # Simulate the converge logic
+            context.entity = natural_key
+            changed, before, after = context.converge(desired_entity)
+            if changed:
+                result["changed"] = True
+            if after is not None:
+                result["repository"] = after
+        except Exception as e:
+            result["failed"] = True
+            result["msg"] = str(e)
+        return result
+
+    def process_batch(self, entities, concurrency=10):
         results = []
         overall_changed = False
-        for entity in entities:
-            result = {
-                "name": entity["name"],
-                "changed": False,
-                "failed": False,
-                "msg": "",
-            }
-            try:
-                context = self.context_class(self.pulp_ctx)
-                natural_key = {"name": entity["name"]}
-                desired_attributes = {}
-                if "description" in entity and entity["description"] is not None:
-                    desired_attributes["description"] = entity["description"]
-
-                state = entity.get("state", "present")
-                if state == "present":
-                    desired_entity = desired_attributes
-                elif state == "absent":
-                    desired_entity = None
-                else:
-                    result["failed"] = True
-                    result["msg"] = f"Invalid state '{state}'"
-                    results.append(result)
-                    continue
-
-                # Simulate the converge logic
-                context.entity = natural_key
-                changed, before, after = context.converge(desired_entity)
-                if changed:
-                    result["changed"] = True
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(self.process_single_entity, entity) for entity in entities]
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result["changed"]:
                     overall_changed = True
-                if after is not None:
-                    result["repository"] = after
-            except Exception as e:
-                result["failed"] = True
-                result["msg"] = str(e)
-            results.append(result)
+                results.append(result)
+
+        # Sort results by original order
+        results.sort(key=lambda x: [e["name"] for e in entities].index(x["name"]))
 
         if overall_changed:
             self.set_changed()
@@ -168,9 +195,10 @@ def main():
                 },
                 "required": True,
             },
+            "concurrency": {"type": "int", "default": 10},
         },
     ) as module:
-        module.process_batch(module.params["repositories"])
+        module.process_batch(module.params["repositories"], module.params["concurrency"])
 
 
 if __name__ == "__main__":
